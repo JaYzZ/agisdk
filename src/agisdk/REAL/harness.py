@@ -10,22 +10,109 @@ import random
 import json
 import time
 import logging
-import tempfile
-import dataclasses
-from typing import List, Dict, Optional, Any, Union, Tuple, Type
+from typing import List, Dict, Optional, Any, Tuple
 from pathlib import Path
 from statistics import mean, median, stdev
-import multiprocessing as mp
-from functools import partial
+
+# Ray imports for distributed execution
+try:
+    import ray
+    RAY_AVAILABLE = True
+except ImportError:
+    RAY_AVAILABLE = False
 
 # Import the necessary browsergym components
 from agisdk.REAL.browsergym.experiments import Agent, AbstractAgentArgs, EnvArgs, ExpArgs, get_exp_result
 from agisdk.REAL.demo_agent.basic_agent import DemoAgentArgs
 
-# Worker initialization function for multiprocessing
-def init_worker():
-    global tempfile
-    import tempfile
+# Ray remote actor for distributed task execution
+if RAY_AVAILABLE:
+    @ray.remote(resources={"memory_gb": 1})
+    def run_task_ray(
+        task_name: str,
+        agent_args: "AbstractAgentArgs",
+        env_args_dict: Dict[str, Any],
+        results_dir: str,
+        continue_previous: bool = False,
+        use_cache: bool = True,
+        run_uuid: Optional[str] = None
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Run a single task."""
+        # Import required modules inside the function for Ray workers
+        import os
+        import time
+        import json
+        from pathlib import Path
+        from agisdk.REAL.browsergym.experiments import EnvArgs, ExpArgs, get_exp_result
+        
+        print(f"Running task: {task_name}")
+        
+        # Set task name in env args
+        env_args_dict["task_name"] = task_name
+        
+        # Create EnvArgs from dictionary
+        env_args = EnvArgs(**env_args_dict)
+        
+        # Set up experiment
+        exp_args = ExpArgs(
+            env_args=env_args,
+            agent_args=agent_args
+        )
+        
+        # Start timing
+        start_time = time.time()
+        
+        # Run experiment
+        exp_args.prepare(results_dir)
+        
+        # Add essential metadata to summary_info.json before running the experiment
+        summary_info_path = Path(exp_args.exp_dir) / "summary_info.json"
+        
+        # Extract metadata for cache key
+        agent_type = agent_args.agent_name if hasattr(agent_args, "agent_name") else type(agent_args).__name__
+        model_name = getattr(agent_args, "model_name", "unknown")
+        max_steps = env_args.max_steps
+        
+        # Create initial summary info with metadata
+        initial_summary = {
+            "task_name": task_name,
+            "agent_type": agent_type,
+            "model_name": model_name,
+            "max_steps": max_steps,
+            "cache_key": f"{task_name}_{agent_type}_{model_name}_{max_steps}",
+            "experiment_status": "started",
+            "run_uuid": run_uuid,
+        }
+        
+        # Write initial summary info
+        with open(summary_info_path, "w") as f:
+            json.dump(initial_summary, f, indent=4)
+        
+        # Run the experiment
+        exp_args.run()
+        
+        # End timing
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        
+        # Get results
+        exp_result = get_exp_result(exp_args.exp_dir)
+        exp_record = exp_result.get_exp_record()
+        
+        # Add timing information to the record
+        exp_record['elapsed_time'] = elapsed_time
+        
+        # Add experiment directory to the record
+        exp_record['exp_dir'] = str(exp_args.exp_dir)
+        
+        # Print current task result
+        print(f"Task: {task_name}")
+        print(f"  Reward: {exp_record.get('cum_reward', 0)}")
+        success = exp_record.get('cum_reward', 0) == 1
+        print(f"  Success: {success}")
+        print(f"  Time: {elapsed_time:.2f} seconds")
+        
+        return task_name, exp_record
 
 logger = logging.getLogger(__name__)
 
@@ -33,12 +120,16 @@ class harness:
     """
     A simplified harness for running browsergym tasks with various agents.
     
-    Example usage with built-in agent:
-        harness = REAL.harness(model="gpt-4o", leaderboard=True)
+    Example usage with built-in agent (sequential):
+        harness = REAL.harness(model="gpt-4o", num_workers=1)
+        results = harness.run()
+        
+    Example usage with Ray distributed execution:
+        harness = REAL.harness(model="gpt-4o", num_workers=4)
         results = harness.run()
         
     Example usage with custom agent:
-        harness = REAL.harness(agentargs=YourAgentArgs(), leaderboard=True)
+        harness = REAL.harness(agentargs=YourAgentArgs(), num_workers=2)
         results = harness.run()
     """
     
@@ -61,8 +152,7 @@ class harness:
         extensions_dir: str = None,
         viewport: dict = None,
         results_dir: str = "./results",
-        parallel: bool = False,
-        num_workers: int = 4,
+        num_workers: int = 1,
         use_cache: bool = True,
         cache_only: bool = False,
         force_refresh: bool = False,
@@ -70,6 +160,7 @@ class harness:
         api_key: str = None,
         run_name: str = None,
         model_id_name: str = None,
+        system_message_handling: str = None,
     ):
         """
         Initialize the harness with the provided configuration.
@@ -92,14 +183,18 @@ class harness:
             extensions_dir: Path to Chrome extensions directory
             viewport: Dictionary with width and height for browser viewport
             results_dir: Directory to store results
-            parallel: Whether to run tasks in parallel
-            num_workers: Number of parallel workers
+            num_workers: Number of parallel workers (if > 1, uses Ray for distributed execution)
             use_cache: Whether to use cached results
             cache_only: Only use cached results, don't run missing tasks
             force_refresh: Force re-running tasks even if cached results exist
+            sample_tasks: Number of times to run each task
+            api_key: API key for leaderboard submission
+            run_name: Name for the run (used with api_key to get run_id)
+            model_id_name: Model ID name for API (defaults to model parameter)
+            system_message_handling: How to handle system messages - "separate" (default) or "combined" (no system prompt).
+                                   Only applies when using the model parameter. For o1-mini, defaults to "combined".
         """
         self.results_dir = results_dir
-        self.parallel = parallel
         self.num_workers = num_workers
         self.use_cache = use_cache
         self.cache_only = cache_only
@@ -111,10 +206,22 @@ class harness:
         logger.info(f"Harness initialized with model={model or 'custom'}, task={task_name or task_type}, Sampling each task {sample_tasks} times")
         # Initialize agent arguments
         if agentargs is not None:
+            if system_message_handling is not None:
+                logger.warning("system_message_handling parameter is ignored when using custom agentargs")
             self.agent_args = agentargs
         elif model is not None:
-            # Set system message handling based on model
-            system_message_handling = "combined" if model == "o1-mini" else "separate"
+            # Validate system_message_handling parameter if provided
+            if system_message_handling is not None:
+                valid_values = ["separate", "combined"]
+                if system_message_handling not in valid_values:
+                    raise ValueError(f"system_message_handling must be one of {valid_values}, got: {system_message_handling}")
+            
+            # Set system message handling based on parameter or model default
+            if system_message_handling is not None:
+                use_system_message_handling = system_message_handling
+            else:
+                use_system_message_handling = "combined" if model == "o1-mini" else "separate"
+                
             self.agent_args = DemoAgentArgs(
                 model_name=model,
                 chat_mode=False,
@@ -122,7 +229,7 @@ class harness:
                 use_html=use_html,
                 use_axtree=use_axtree,
                 use_screenshot=use_screenshot,
-                system_message_handling=system_message_handling
+                system_message_handling=use_system_message_handling
             )
         else:
             raise ValueError("Either model or agentargs must be provided")
@@ -163,7 +270,6 @@ class harness:
         
         # Handle run_id and leaderboard submission
         if run_id:
-            # self.env_args["task_kwargs"] = {"run_id": run_id}
             
             # Set the RUNID environment variable when leaderboard submission is enabled
             if leaderboard:
@@ -185,9 +291,6 @@ class harness:
         # Create default results directory if it doesn't exist
         if not os.path.exists(results_dir):
             os.makedirs(results_dir)
-            
-        # Log initialization
-        logger.info(f"Harness initialized with model={model or 'custom'}, task={task_name or task_type}")
     
     def run(self, tasks: List[str] = None) -> Dict[str, Any]:
         """
@@ -224,7 +327,6 @@ class harness:
             agent_args=self.agent_args,
             env_args_dict=self.env_args,
             results_dir=self.results_dir,
-            parallel=self.parallel,
             num_workers=self.num_workers,
             use_cache=self.use_cache,
             cache_only=self.cache_only,
@@ -387,8 +489,7 @@ class harness:
         agent_args: AbstractAgentArgs,
         env_args_dict: Dict[str, Any],
         results_dir: str = "./results",
-        parallel: bool = False,
-        num_workers: int = 5,
+        num_workers: int = 1,
         continue_previous: bool = False,
         use_cache: bool = True,
         cache_only: bool = False,
@@ -402,8 +503,7 @@ class harness:
             agent_args: Arguments for the agent
             env_args_dict: Dictionary of arguments for the environment
             results_dir: Directory to store results
-            parallel: Whether to run tasks in parallel
-            num_workers: Number of workers to use for parallel execution
+            num_workers: Number of workers (if > 1, uses Ray for distributed execution)
             continue_previous: Whether to try to continue from previous runs
             use_cache: Whether to use and update the cache
             cache_only: Whether to only use cached results without running missing tasks
@@ -414,11 +514,9 @@ class harness:
         """
         # Generate a unique run ID for this batch (but potentially override with cached run_id for leaderboard)
         import uuid
-        from datetime import datetime
         
         # Initialize with a new UUID
         run_uuid = str(uuid.uuid4())
-        run_timestamp = datetime.now().isoformat()
         
         
         '''
@@ -446,8 +544,6 @@ class harness:
                         run_uuid = cached_run_id
                         break
         
-        print(f"Running multiple tasks with ID: {run_uuid}")
-        
         # If this is a leaderboard run, set the RUNID environment variable
         if self.leaderboard:
             if hasattr(self, "run_id") and self.run_id:
@@ -456,8 +552,9 @@ class harness:
                 print(f"Using explicitly provided run_id: {run_uuid}")
             logger.info(f"Setting RUNID environment variable to {run_uuid} for leaderboard submission")
             os.environ["RUNID"] = run_uuid
-        
         # Store run metadata for tracking
+        import time
+        run_timestamp = time.time()
         run_metadata = {
             "run_uuid": run_uuid,
             "run_timestamp": run_timestamp,
@@ -466,7 +563,6 @@ class harness:
             "total_tasks": len(tasks),
             "leaderboard": self.leaderboard if hasattr(self, "leaderboard") else False
         }
-        
         print(f"Starting run with ID: {run_uuid}")
         
         # Initialize results dictionary
@@ -497,25 +593,36 @@ class harness:
         # Run tasks if needed
         if tasks_to_run:
             print(f"Running {len(tasks_to_run)} tasks...")
+            print(f"Number of workers configured: {num_workers}")
             
-            if parallel:
-                # Create a partial function with the fixed arguments
-                run_task_partial = partial(
-                    self._run_single_task,
-                    agent_args=agent_args,
-                    env_args_dict=env_args_dict,
-                    results_dir=results_dir,
-                    continue_previous=continue_previous,
-                    use_cache=use_cache,
-                    run_uuid=run_uuid
-                )
+            if num_workers > 1:
+                if not RAY_AVAILABLE:
+                    raise RuntimeError("Ray is required for parallel execution but not available. Please install Ray with: pip install ray")
                 
-                # Run tasks in parallel using multiprocessing
-                with mp.Pool(processes=num_workers, initializer=init_worker) as pool:
-                    new_results = dict(pool.map(run_task_partial, tasks_to_run))
-                    
-                    # Merge with cached results
-                    results.update(new_results)
+                if not ray.is_initialized():
+                    # Initialize Ray with memory tokens as concurrency limit
+                    ray.init(resources={"memory_gb": num_workers})
+                
+                # Submit all tasks as futures - Ray will queue them based on memory_gb availability
+                ray_futures = [
+                    run_task_ray.remote(
+                        task_name=task_name,
+                        agent_args=agent_args,
+                        env_args_dict=env_args_dict,
+                        results_dir=results_dir,
+                        continue_previous=continue_previous,
+                        use_cache=use_cache,
+                        run_uuid=run_uuid
+                    )
+                    for task_name in tasks_to_run
+                ]
+                
+                # Get results from Ray workers
+                ray_results = ray.get(ray_futures)
+                new_results = dict(ray_results)
+                
+                # Merge with cached results
+                results.update(new_results)
             else:
                 # Run tasks sequentially
                 for task_name in tasks_to_run:
